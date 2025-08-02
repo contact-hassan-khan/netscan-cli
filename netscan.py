@@ -10,9 +10,8 @@ import logging
 import socket
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Any  # <-- Fix here
 
 import scapy.all as scapy
 from loguru import logger
@@ -57,7 +56,7 @@ class Host:
         self.udp: Dict[int, str] = {}
         self.vulns: List[str] = []
 
-    def to_dict(self) -> Dict[str, any]:
+    def to_dict(self) -> Dict[str, Any]:  # <-- Fix here
         return {
             "ip": self.ip,
             "mac": self.mac,
@@ -72,16 +71,15 @@ class Host:
 # --------------------------------------------------------------------------- #
 async def arp_ping(cidr: str) -> List[str]:
     ans, _ = scapy.arping(cidr, verbose=False, timeout=2)
-    return [rcv.psrc for _, rcv in ans]
+    hosts = []
+    for snd, rcv in ans:
+        ip = rcv.psrc
+        mac = rcv.hwsrc
+        hosts.append((ip, mac))
+    return hosts
 
 
 async def icmp_ping(cidr: str) -> List[str]:
-    proc = await asyncio.create_subprocess_exec(
-        "ping", "-c1", "-W1", "-b", str(ipaddress.ip_network(cidr).network_address),
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    await proc.wait()
-    # naive fallback
     net = ipaddress.ip_network(cidr)
     tasks = [asyncio.create_task(_icmp_single(str(ip))) for ip in net.hosts()]
     results = await asyncio.gather(*tasks)
@@ -89,8 +87,14 @@ async def icmp_ping(cidr: str) -> List[str]:
 
 
 async def _icmp_single(ip: str) -> tuple[str, bool]:
+    # Cross-platform ping
+    import platform
+    if platform.system().lower() == "windows":
+        cmd = ["ping", "-n", "1", "-w", "1000", ip]
+    else:
+        cmd = ["ping", "-c1", "-W1", ip]
     proc = await asyncio.create_subprocess_exec(
-        "ping", "-c1", "-W1", ip, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     return ip, (await proc.wait()) == 0
 
@@ -176,8 +180,11 @@ def console_report(results: Dict[str, Host]) -> None:
 
 
 def save_json(results: Dict[str, Host], path: Path) -> None:
-    with path.open("w") as fp:
-        json.dump({ip: h.to_dict() for ip, h in results.items()}, fp, indent=2)
+    try:
+        with path.open("w") as fp:
+            json.dump({ip: h.to_dict() for ip, h in results.items()}, fp, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to write JSON report: {e}")
 
 
 def save_html(results: Dict[str, Host], path: Path) -> None:
@@ -210,8 +217,11 @@ def save_html(results: Dict[str, Host], path: Path) -> None:
 </html>
     """
     )
-    with path.open("w") as fp:
-        fp.write(template.render(results=results))
+    try:
+        with path.open("w") as fp:
+            fp.write(template.render(results=results))
+    except Exception as e:
+        logger.error(f"Failed to write HTML report: {e}")
 
 
 # --------------------------------------------------------------------------- #
@@ -233,17 +243,29 @@ async def main() -> None:
     tcp_ports = [int(p) for p in args.ports.split(",") if p] or TOP_TCP
     udp_ports = TOP_UDP
 
-    logger.info("Starting discovery", target=args.target, scan_type=args.scan_type)
+    logger.info(f"Starting discovery: target={args.target}, scan_type={args.scan_type}")
     if args.scan_type == "arp":
-        hosts = await arp_ping(args.target)
+        hosts_mac = await arp_ping(args.target)
+        hosts = [ip for ip, _ in hosts_mac]
+        hosts_dict = {ip: Host(ip, mac) for ip, mac in hosts_mac}
     elif args.scan_type == "icmp":
         hosts = await icmp_ping(args.target)
+        hosts_dict = {ip: Host(ip) for ip in hosts}
     else:
-        hosts = list(set(await arp_ping(args.target) + await icmp_ping(args.target)))
+        hosts_mac = await arp_ping(args.target)
+        hosts_icmp = await icmp_ping(args.target)
+        hosts = list(set([ip for ip, _ in hosts_mac] + hosts_icmp))
+        hosts_dict = {ip: Host(ip) for ip in hosts}
+        for ip, mac in hosts_mac:
+            hosts_dict[ip].mac = mac
 
-    logger.info("Discovered hosts", count=len(hosts))
+    logger.info(f"Discovered hosts: count={len(hosts)}")
 
     results = await tcp_scan(hosts, tcp_ports)
+    # Merge MAC addresses into results
+    for ip, host in hosts_dict.items():
+        if ip in results:
+            results[ip].mac = host.mac
     await udp_scan(hosts, udp_ports, results)
 
     console_report(results)

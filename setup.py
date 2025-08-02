@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import setup
 
 setup(
     name="netscan-cli",
@@ -13,5 +13,5 @@ setup(
         "jinja2==3.1.4",
     ],
     entry_points={"console_scripts": ["netscan=netscan:main"]},
-    python_requires=">=3.9",
+    python_requires=">=3.7",  # Match your README
 )
